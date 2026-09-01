@@ -1,19 +1,6 @@
 // ============================================================
-//  Safelink Bridge Server
+//  Safelink Bridge Server (Updated)
 //  Connects Telegram Bot API ↔ Safelink WebSocket clients
-//
-//  Requirements: Node.js 20+, `ws` package
-//  Install:  npm install ws
-//  Run:      node bridge-server.js
-//
-//  Set environment variables:
-//    TELEGRAM_BOT_TOKEN  - from @BotFather
-//    PORT                - WebSocket port (default 8080)
-//
-//  The bridge does two things:
-//    1. Polls Telegram Bot API for incoming messages from Telegram users
-//    2. Accepts WebSocket connections from Safelink clients
-//    3. Relays messages between the two, re-encrypting as needed
 // ============================================================
 
 const WebSocket = require('ws');
@@ -23,44 +10,33 @@ const crypto = require('crypto');
 // ---- Config ----
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
 const PORT = parseInt(process.env.PORT || '8080');
-const POLL_INTERVAL = 1000; // 1 second
+const POLL_INTERVAL = 1000;
 const TG_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 if (BOT_TOKEN === 'YOUR_BOT_TOKEN_HERE') {
-  console.error('\n❌ No TELEGRAM_BOT_TOKEN set!');
-  console.error('   Get one from @BotFather on Telegram, then run:');
-  console.error('   TELEGRAM_BOT_TOKEN=123456:ABC-DEF1234 node bridge-server.js\n');
+  console.error('❌ No TELEGRAM_BOT_TOKEN set!');
   process.exit(1);
 }
 
 // ---- State ----
-// Connected Safelink clients, keyed by their Safelink user ID
-const clients = new Map();
-// Mapping: Telegram chat ID → Safelink user ID
-// This maps a Telegram conversation to a Safelink user
-const tgChatToSafelink = new Map();
-const safelinkToTgChat = new Map();
-// Pending connections: when a Telegram user first messages the bot,
-// we need to pair them with a Safelink user
-const pendingPairs = new Map(); // pairCode → { tgChatId, tgUserName }
+const clients = new Map(); // userId → ws connection
+const tgChatToSafelink = new Map(); // tgChatId → safelinkUserId (persisted)
+const safelinkToTgChat = new Map(); // safelinkUserId → tgChatId (persisted)
+const pendingPairs = new Map(); // pairCode → { safelinkUserId, safelinkName, createdAt }
 let lastUpdateId = 0;
 
 // ---- WebSocket Server ----
 const wss = new WebSocket.Server({ port: PORT });
 console.log(`🚀 Safelink Bridge Server running on port ${PORT}`);
-console.log(`🔗 WebSocket endpoint: ws://localhost:${PORT}`);
-console.log(`🤖 Telegram Bot: polling enabled\n`);
 
 wss.on('connection', (ws, req) => {
-  const ip = req.socket.remoteAddress;
-  console.log(`📥 New WebSocket connection from ${ip}`);
+  console.log(`📥 New WebSocket connection from ${req.socket.remoteAddress}`);
 
   ws.on('message', async (data) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch (e) { return; }
 
     // ---- Client registration ----
-    // When a Safelink client connects, it sends its user ID
     if (msg.type === 'register') {
       const userId = msg.userId;
       clients.set(userId, ws);
@@ -68,20 +44,29 @@ wss.on('connection', (ws, req) => {
       ws.isRegistered = true;
       console.log(`✅ Registered Safelink user: ${userId}`);
       ws.send(JSON.stringify({ type: 'registered', userId }));
+
+      // If this user is already paired on Telegram, tell them
+      if (safelinkToTgChat.has(userId)) {
+        const tgChatId = safelinkToTgChat.get(userId);
+        console.log(`🔗 User ${userId} already paired with Telegram chat ${tgChatId}`);
+        ws.send(JSON.stringify({
+          type: 'telegram-paired',
+          tgChatId: tgChatId,
+        }));
+      }
       return;
     }
 
-    // ---- Pairing: Safelink user requests a Telegram bridge code ----
+    // ---- Pairing: Safelink user requests a pairing code ----
     if (msg.type === 'request-pair-code') {
-      // Generate a short pairing code
       const pairCode = crypto.randomBytes(3).toString('hex').toUpperCase();
       pendingPairs.set(pairCode, {
         safelinkUserId: ws.userId,
-        safelinkName: msg.safelinkName,
+        safelinkName: msg.safelinkName || 'User',
         createdAt: Date.now(),
       });
-      // Expire after 5 minutes
-      setTimeout(() => pendingPairs.delete(pairCode), 300000);
+      // Expire after 10 minutes
+      setTimeout(() => pendingPairs.delete(pairCode), 600000);
       ws.send(JSON.stringify({ type: 'pair-code', code: pairCode }));
       console.log(`🔑 Pair code generated: ${pairCode} for user ${ws.userId}`);
       return;
@@ -93,12 +78,12 @@ wss.on('connection', (ws, req) => {
       if (tgChatId) {
         const text = `[${msg.senderName}]: ${msg.text}`;
         await sendTelegramMessage(tgChatId, text);
-        console.log(`📤 Safelink → Telegram (chat ${tgChatId}): ${msg.text}`);
+        console.log(`📤 Safelink → Telegram: ${msg.text}`);
       }
       return;
     }
 
-    // ---- Safelink → Safelink message (relay between two Safelink clients) ----
+    // ---- Relay between Safelink clients ----
     if (msg.type === 'relay') {
       const targetWs = clients.get(msg.toUserId);
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
@@ -114,7 +99,6 @@ wss.on('connection', (ws, req) => {
 
     // ---- Group relay ----
     if (msg.type === 'group-relay') {
-      // Broadcast to all group members connected to this server
       const members = msg.members || [];
       for (const memberId of members) {
         if (memberId === ws.userId) continue;
@@ -158,7 +142,6 @@ async function pollTelegram() {
       }
     }
   } catch (e) {
-    // Network errors are normal during long polling, just continue
     if (e.code !== 'ETIMEDOUT' && e.code !== 'ECONNRESET') {
       console.error('Telegram poll error:', e.message);
     }
@@ -172,7 +155,7 @@ async function handleTelegramMessage(message) {
 
   console.log(`📥 Telegram message from ${userName} (chat ${chatId}): ${text || '[media]'}`);
 
-  // ---- Handle /start command ----
+  // ---- /start ----
   if (text === '/start') {
     await sendTelegramMessage(chatId,
       `🤖 Welcome to Safelink Bridge!\n\n` +
@@ -181,13 +164,12 @@ async function handleTelegramMessage(message) {
       `1. Open Safelink app\n` +
       `2. Go to Settings → Telegram Bridge\n` +
       `3. Get a pairing code\n` +
-      `4. Send the code here\n\n` +
-      `Example: PAIR ABC123`
+      `4. Send the code here like: PAIR ABC123`
     );
     return;
   }
 
-  // ---- Handle /help command ----
+  // ---- /help ----
   if (text === '/help') {
     await sendTelegramMessage(chatId,
       `📖 Safelink Bridge Commands:\n\n` +
@@ -196,48 +178,51 @@ async function handleTelegramMessage(message) {
       `/status - Check connection status\n` +
       `/unpair - Disconnect from Safelink\n` +
       `PAIR ABC123 - Pair with a Safelink account\n\n` +
-      `You can also forward messages, photos, files, and videos to this bot to share them in Safelink.`
+      `You can also forward messages, photos, files, and videos to share in Safelink.`
     );
     return;
   }
 
-  // ---- Handle /status command ----
+  // ---- /status ----
   if (text === '/status') {
     const paired = tgChatToSafelink.has(chatId.toString());
+    const slId = tgChatToSafelink.get(chatId.toString());
+    const online = slId && clients.has(slId);
     await sendTelegramMessage(chatId,
       `📊 Status:\n\n` +
       `Bridge: ✅ Online\n` +
       `Paired: ${paired ? '✅ Connected to Safelink' : '❌ Not paired'}\n` +
+      `App Online: ${online ? '✅ Yes' : '❌ No (app is closed)'}\n` +
       `Connected Safelink users: ${clients.size}\n\n` +
       `${paired ? 'Messages you send here will appear in Safelink.' : 'Send PAIR <code> to connect.'}`
     );
     return;
   }
 
-  // ---- Handle /unpair command ----
+  // ---- /unpair ----
   if (text === '/unpair') {
     const slId = tgChatToSafelink.get(chatId.toString());
     if (slId) {
       tgChatToSafelink.delete(chatId.toString());
       safelinkToTgChat.delete(slId);
-      await sendTelegramMessage(chatId, '✅ Disconnected from Safelink. Send PAIR <code> to reconnect.');
+      await sendTelegramMessage(chatId, '✅ Disconnected from Safelink.');
     } else {
       await sendTelegramMessage(chatId, '❌ Not currently paired.');
     }
     return;
   }
 
-  // ---- Handle pairing ----
+  // ---- Pairing ----
   if (text.toUpperCase().startsWith('PAIR ')) {
     const code = text.substring(5).trim().toUpperCase();
     const pair = pendingPairs.get(code);
     if (pair) {
-      // Pair this Telegram chat with the Safelink user
+      // Store pairing permanently (survives app disconnect)
       tgChatToSafelink.set(chatId.toString(), pair.safelinkUserId);
       safelinkToTgChat.set(pair.safelinkUserId, chatId.toString());
       pendingPairs.delete(code);
 
-      // Notify the Safelink client
+      // Try to notify the Safelink client if it's connected
       const slWs = clients.get(pair.safelinkUserId);
       if (slWs && slWs.readyState === WebSocket.OPEN) {
         slWs.send(JSON.stringify({
@@ -245,6 +230,9 @@ async function handleTelegramMessage(message) {
           tgChatId: chatId.toString(),
           tgUserName: userName,
         }));
+        console.log(`✅ Notified Safelink app immediately`);
+      } else {
+        console.log(`⚠️ Safelink app is offline. Will notify when it reconnects.`);
       }
 
       await sendTelegramMessage(chatId,
@@ -252,38 +240,32 @@ async function handleTelegramMessage(message) {
         `Your Safelink contact: ${pair.safelinkName}\n\n` +
         `Now you can:\n` +
         `• Send messages here → they appear in Safelink\n` +
-        `• Forward photos, files, videos to this bot → they appear in Safelink\n` +
-        `• Messages from Safelink will appear here\n\n` +
+        `• Forward photos, files, videos → they appear in Safelink\n\n` +
         `Use /status anytime to check connection.`
       );
-      console.log(`🔗 Paired Telegram chat ${chatId} (${userName}) ↔ Safelink ${pair.safelinkUserId}`);
+      console.log(`🔗 Paired Telegram chat ${chatId} ↔ Safelink ${pair.safelinkUserId}`);
     } else {
       await sendTelegramMessage(chatId,
         `❌ Invalid or expired pairing code.\n\n` +
-        `Get a fresh code from your Safelink app: Settings → Telegram Bridge → Get Pair Code.`
+        `Get a fresh code from your Safelink app: Settings → Telegram Bridge.\n` +
+        `Make sure the app is open when you request the code.`
       );
     }
     return;
   }
 
-  // ---- Handle forwarded content / regular messages ----
+  // ---- Forwarded content / regular messages ----
   const slId = tgChatToSafelink.get(chatId.toString());
   if (slId) {
-    // Get the Safelink client and relay the message
     const slWs = clients.get(slId);
     if (slWs && slWs.readyState === WebSocket.OPEN) {
-      // Determine message content
       let content = '';
       let mediaType = null;
 
       if (message.text) {
         content = message.text;
       } else if (message.photo) {
-        // Get highest quality photo
         const photo = message.photo[message.photo.length - 1];
-        content = `[Photo ${photo.width}x${photo.height}]`;
-        mediaType = 'photo';
-        // Download and relay
         const fileUrl = await getTelegramFile(photo.file_id);
         if (fileUrl) {
           slWs.send(JSON.stringify({
@@ -298,8 +280,6 @@ async function handleTelegramMessage(message) {
           return;
         }
       } else if (message.document) {
-        content = `[File: ${message.document.file_name || 'unknown'}]`;
-        mediaType = 'document';
         const fileUrl = await getTelegramFile(message.document.file_id);
         if (fileUrl) {
           slWs.send(JSON.stringify({
@@ -311,12 +291,10 @@ async function handleTelegramMessage(message) {
             fileName: message.document.file_name,
             timestamp: Date.now(),
           }));
-          await sendTelegramMessage(chatId, `✅ File "${message.document.file_name}" forwarded to Safelink.`);
+          await sendTelegramMessage(chatId, `✅ File forwarded to Safelink.`);
           return;
         }
       } else if (message.video) {
-        content = `[Video]`;
-        mediaType = 'video';
         const fileUrl = await getTelegramFile(message.video.file_id);
         if (fileUrl) {
           slWs.send(JSON.stringify({
@@ -331,8 +309,6 @@ async function handleTelegramMessage(message) {
           return;
         }
       } else if (message.voice) {
-        content = '[Voice message]';
-        mediaType = 'voice';
         const fileUrl = await getTelegramFile(message.voice.file_id);
         if (fileUrl) {
           slWs.send(JSON.stringify({
@@ -347,8 +323,6 @@ async function handleTelegramMessage(message) {
           return;
         }
       } else if (message.sticker) {
-        content = `[Sticker: ${message.sticker.emoji || '🙂'}]`;
-        mediaType = 'sticker';
         const fileUrl = await getTelegramFile(message.sticker.file_id);
         if (fileUrl) {
           slWs.send(JSON.stringify({
@@ -376,16 +350,14 @@ async function handleTelegramMessage(message) {
       }));
       console.log(`📤 Telegram → Safelink: "${content}" from ${userName}`);
     } else {
-      await sendTelegramMessage(chatId, '⚠️ Safelink user is offline. Messages will be delivered when they connect.');
+      await sendTelegramMessage(chatId, '⚠️ Safelink app is offline. Open the app and it will receive your messages.');
     }
   } else {
-    // Not paired — prompt to pair
     await sendTelegramMessage(chatId,
       `👋 Hi ${userName}!\n\n` +
-      `This bot connects Telegram to Safelink (a privacy-first messenger).\n\n` +
       `To get started, pair with a Safelink account:\n` +
       `1. Open the Safelink app\n` +
-      `2. Go to Settings → Telegram Bridge → Get Pair Code\n` +
+      `2. Go to Settings → Telegram Bridge\n` +
       `3. Send the code here like: PAIR ABC123\n\n` +
       `Use /help for more commands.`
     );
@@ -395,11 +367,9 @@ async function handleTelegramMessage(message) {
 // ---- Telegram API helpers ----
 async function sendTelegramMessage(chatId, text) {
   try {
-    const url = `${TG_API}/sendMessage`;
-    await fetchJSON(url, 'POST', {
+    await fetchJSON(`${TG_API}/sendMessage`, 'POST', {
       chat_id: chatId,
       text: text,
-      parse_mode: 'HTML',
     });
   } catch (e) {
     console.error('Failed to send Telegram message:', e.message);
@@ -418,7 +388,7 @@ async function getTelegramFile(fileId) {
   return null;
 }
 
-// ---- HTTP helper (using built-in https, no external deps) ----
+// ---- HTTP helper ----
 function fetchJSON(url, method = 'GET', body = null) {
   return new Promise((resolve, reject) => {
     const urlObj = new URL(url);
@@ -432,7 +402,6 @@ function fetchJSON(url, method = 'GET', body = null) {
       const bodyStr = JSON.stringify(body);
       options.headers['Content-Type'] = 'application/json';
       options.headers['Content-Length'] = Buffer.byteLength(bodyStr);
-      // Need to pass body to the request
       const req = https.request(options, (res) => {
         let data = '';
         res.on('data', chunk => data += chunk);
@@ -460,7 +429,7 @@ function fetchJSON(url, method = 'GET', body = null) {
 // ---- Start polling ----
 console.log('📡 Starting Telegram polling...');
 setInterval(pollTelegram, POLL_INTERVAL);
-pollTelegram(); // first poll immediately
+pollTelegram();
 
 // ---- Graceful shutdown ----
 process.on('SIGINT', () => {
@@ -471,8 +440,5 @@ process.on('SIGINT', () => {
 
 // ---- Connection stats ----
 setInterval(() => {
-  if (clients.size > 0 || tgChatToSafelink.size > 0) {
-    console.log(`📊 Stats: ${clients.size} Safelink clients, ${tgChatToSafelink.size} Telegram pairs`);
-  }
+  console.log(`📊 Stats: ${clients.size} Safelink clients, ${tgChatToSafelink.size} Telegram pairs`);
 }, 30000);
-  
